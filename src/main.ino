@@ -56,6 +56,8 @@
 #define TINY_GSM_USE_GPRS true
 #define TINY_GSM_USE_WIFI false
 
+#define DISCONNECT_PIN 32
+
 // set GSM PIN, if any
 #define GSM_PIN ""
 
@@ -80,7 +82,9 @@ const char* topicLedStatus = "GsmClientTest/ledStatus";
 #include <esp_adc_cal.h>
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
-#include <SD.h>
+
+#include <SdFat.h>
+#include "DataManager.h"
 
 
 #include "TimeLib.h"
@@ -95,6 +99,13 @@ TinyGsm        modem(SerialAT);
 #endif
 TinyGsmClient client(modem);
 PubSubClient  mqtt(client);
+SdFat SD; 
+DataManager dataManager(SD, &mqtt, "mqttest", "gps_log.txt", "offline_log.txt");
+
+JsonDocument message;
+JsonDocument configMessage;
+
+// int good_connection = 1;
 
 #define LED_PIN 13
 int ledStatus = LOW;
@@ -102,7 +113,8 @@ int ledStatus = LOW;
 int vref = 1100;
 
 uint32_t lastReconnectAttempt = 0;
-uint32_t lastGPSUpdate = 0;
+uint32_t lastGPSUpdate = 20000;
+uint32_t lastFileUpdate = 10000;
 
 char buf[300];
 
@@ -154,6 +166,22 @@ boolean mqttConnect() {
   return mqtt.connected();
 }
 
+void initSDCard(){
+  SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, SD_SCK_MHZ(1))) {
+      SerialMon.println("SDCard MOUNT FAIL");
+  } else {
+      SerialMon.println("Success --- SDCard");
+      dataManager.sdCardAvailable = true;
+      csd_t csd;
+      if (!SD.card()->readCSD(&csd)) { 
+        Serial.print(F("readInfo failed\n"));
+      }
+      SerialMon.printf("cardSize: %f  MB (MB = 1,000,000 bytes)\n",0.000512 * csd.capacity());
+  }
+}
+
+
 void setup() {
   // Set console baud rate
   SerialMon.begin(115200);
@@ -182,45 +210,26 @@ void setup() {
 
   setupAdcVref();
 
+  // pinMode(DISCONNECT_PIN, INPUT_PULLUP);
+  // initSDCard();
+
   // Set GSM module baud rate
   // TinyGsmAutoBaud(SerialAT, GSM_AUTOBAUD_MIN, GSM_AUTOBAUD_MAX);
   SerialAT.begin(UART_BAUD, SERIAL_8N1, BOARD_MODEM_RX_PIN, BOARD_MODEM_TX_PIN);
   delay(6000);
 
-  SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS)) {
-      Serial.println("SDCard MOUNT FAIL");
-  } else {
-      uint32_t cardSize = SD.cardSize() / (1024 * 1024);
-      String str = "SDCard Size: " + String(cardSize) + "MB";
-      Serial.println(str);
-  }
-
   // Restart takes quite some time
   // To skip it, call init() instead of restart()
   SerialMon.println("Initializing modem...");
-  modem.restart();
-  // modem.init();
+  // modem.restart();
+  modem.init();
 
   String modemInfo = modem.getModemInfo();
   SerialMon.print("Modem Info: ");
   SerialMon.println(modemInfo);
 
-#if TINY_GSM_USE_GPRS
   // Unlock your SIM card with a PIN if needed
   if (GSM_PIN && modem.getSimStatus() != 3) { modem.simUnlock(GSM_PIN); }
-#endif
-
-#if TINY_GSM_USE_WIFI
-  // Wifi connection parameters must be set before waiting for the network
-  SerialMon.print(F("Setting SSID/password..."));
-  if (!modem.networkConnect(wifiSSID, wifiPass)) {
-    SerialMon.println(" fail");
-    delay(10000);
-    return;
-  }
-  SerialMon.println(" success");
-#endif
 
   SerialMon.print("Waiting for network...");
   if (!modem.waitForNetwork()) {
@@ -232,7 +241,6 @@ void setup() {
 
   if (modem.isNetworkConnected()) { SerialMon.println("Network connected"); }
 
-#if TINY_GSM_USE_GPRS
   // GPRS connection parameters are usually set after network registration
   SerialMon.print(F("Connecting to "));
   SerialMon.print(apn);
@@ -244,8 +252,6 @@ void setup() {
   SerialMon.println(" success");
 
   if (modem.isGprsConnected()) { SerialMon.println("GPRS connected"); }
-#endif
-
 
   // Disable gnss
   modem.sendAT("+CGNSSPWR=0");
@@ -301,7 +307,10 @@ void loop() {
   }
 
   uint32_t t = millis();
-  if (!mqtt.connected()) {
+  if (
+      !mqtt.connected() 
+      // && good_connection
+  ) {
     SerialMon.println("=== MQTT NOT CONNECTED ===");
     // Reconnect every 10 seconds
     if (t - lastReconnectAttempt > 10000L) {
@@ -312,29 +321,54 @@ void loop() {
     return;
   }
 
+  // if(!digitalRead(DISCONNECT_PIN)){
+  //   good_connection = !good_connection;
+  //   digitalWrite(LED_PIN,!good_connection);
+  //   if(!good_connection){
+  //     mqtt.disconnect();
+  //     Serial.println("DISCONNECTING");
+  //   }
+  //   delay(500);
+  // }
+
   if(t - lastGPSUpdate > 20000){
     lastGPSUpdate = t;
     char buf[300];
       modem.sendAT(GF("+CGNSSINFO"));
       if (modem.waitResponse(GF(GSM_NL "+CGNSSINFO:")) == 1) {
-        digitalWrite(LED_PIN, 1);
+        // digitalWrite(LED_PIN, 1);
         uint16_t fixMode = getIntFromStreamBefore(',');
         if (fixMode > 0 && fixMode < 4){
             String gpsData = modem.stream.readStringUntil('\n');
             gpsData.trim();
+            /*
+            sats: 0-1
+            lat: 4-5
+            latNS: 5-6
+            lng: 6-7
+            */
+            // gpsData
             float battery_voltage = ((float)analogRead(BOARD_ADC_PIN) / 4095.0) * 2.0 * 3.3 * (vref / 1000.0);
-            sprintf(buf, "{\"GPS\":\"%s\",\"ID\":\"%s\",\"VBat\":%f}", gpsData.c_str(), modem.getIMEI().c_str(), battery_voltage);
-            mqtt.publish("gsm/gps_raw", buf);
+            message.clear();
+            message["gps"] = gpsData.c_str();
+            message["ID"] = modem.getIMEI().c_str();
+            message["VBat"] = battery_voltage;
+            // sprintf(buf, "{\"GPS\":\"%s\",\"ID\":\"%s\",\"VBat\":%f}", gpsData.c_str(), modem.getIMEI().c_str(), battery_voltage);
+            // mqtt.publish("gsm/gps_raw", buf);
+            dataManager.sendMessage(message);
         } else {
             // Serial.print(millis());
             Serial.printf("%ld -> fix %d\n", millis(), fixMode);
         }
       } else {
-        digitalWrite(LED_PIN, 0);
+        // digitalWrite(LED_PIN, 0);
         Serial.printf("No modem response\n");
       }
   }
-
+  if(t - lastFileUpdate > 10000L){
+    lastFileUpdate = t;
+    dataManager.loop();
+  }
   mqtt.loop();
 }
 
